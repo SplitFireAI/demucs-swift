@@ -49,8 +49,10 @@ final class SeparationViewModel: ObservableObject {
     }
 
     /// Progress arrives from background threads and can land after the step
-    /// it describes has finished; only apply it while that step is current.
-    private func update(_ progress: Phase) {
+    /// it describes has finished, or after a newer run has started; only
+    /// apply it while that run and step are current.
+    private func update(_ progress: Phase, generation current: Int) {
+        guard current == generation else { return }
         switch (phase, progress) {
         case (.downloading, .downloading), (.separating, .separating):
             phase = progress
@@ -65,7 +67,7 @@ final class SeparationViewModel: ObservableObject {
             if !DemucsEngine.isDownloaded(model) {
                 phase = .downloading(0)
                 try await DemucsEngine.download(model) { progress in
-                    Task { @MainActor in self.update(.downloading(progress.fraction)) }
+                    Task { @MainActor in self.update(.downloading(progress.fraction), generation: current) }
                 }
             }
             if engine.loadedModel != model {
@@ -80,7 +82,7 @@ final class SeparationViewModel: ObservableObject {
                 right: audio.right,
                 sampleRate: audio.sampleRate
             ) { progress in
-                Task { @MainActor in self.update(.separating(progress.fraction)) }
+                Task { @MainActor in self.update(.separating(progress.fraction), generation: current) }
             }
 
             let outputDirectory = FileManager.default.temporaryDirectory
@@ -154,7 +156,7 @@ enum AudioFile {
         for (index, samples) in [stem.left, stem.right].enumerated() {
             samples.withUnsafeBufferPointer { source in
                 guard let base = source.baseAddress else { return }
-                channels[index].update(from: base, count: source.count)
+                channels[index].update(from: base, count: min(source.count, stem.left.count))
             }
         }
 
