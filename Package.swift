@@ -11,7 +11,7 @@ let localFrameworkAbsolutePath = packageRoot.appendingPathComponent(localFramewo
 let releaseFrameworkURL =
     "https://github.com/SplitFireAI/demucs-rs/releases/download/swift-v0.1.0/DemucsFramework.xcframework.zip"
 let releaseFrameworkChecksum =
-    "0000000000000000000000000000000000000000000000000000000000000000"
+    "618b2d32ba79780310745fe4d452c8382bdd448f8efa09f06d2d518caaa6efac"
 
 // `make macos` (or ios, tvos, visionos) drops a locally built framework next to
 // this file; SwiftPM uses it when present and the release asset otherwise.
