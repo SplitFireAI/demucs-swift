@@ -19,6 +19,9 @@ import Testing
     #expect(DemucsError(.NotLoaded) == .notLoaded)
     #expect(DemucsError(.NotCached(modelId: "htdemucs")) == .notDownloaded(modelID: "htdemucs"))
     #expect(DemucsError(.InvalidInput(reason: "empty")) == .invalidInput("empty"))
+    #expect(DemucsError(.Download(reason: "timeout")) == .downloadFailed("timeout"))
+    #expect(DemucsError(.Io(reason: "denied")) == .io("denied"))
+    #expect(DemucsError(.Inference(reason: "gpu")) == .inferenceFailed("gpu"))
 }
 
 @Test func modelCatalogMatchesTheRustSide() {
