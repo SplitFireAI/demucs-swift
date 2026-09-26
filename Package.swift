@@ -1,19 +1,33 @@
-// swift-tools-version:5.9
+// swift-tools-version:6.2
+import Foundation
 import PackageDescription
 
-// These two constants are rewritten automatically by the demucs-rs
-// "Release SDK Swift" workflow on every release. Do not reformat them —
-// the rewrite regex depends on this exact layout.
-//
-// For local development against a locally built framework, comment out the
-// url/checksum binaryTarget below and use the path form instead:
-//   .binaryTarget(name: "DemucsFramework", path: "../demucs-rs/dist/swift/DemucsFramework.xcframework"),
-// (run .github/scripts/build-swift-xcframework.sh in demucs-rs first).
-// Never commit the path form — CI overwrites this file on every release.
+let packageRoot = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+let localFrameworkPath = "DemucsFramework.xcframework"
+let localFrameworkAbsolutePath = packageRoot.appendingPathComponent(localFrameworkPath).path
+
+// Updated automatically by demucs-rs's release-sdk-swift workflow. Keep the
+// layout: the workflow rewrites the quoted string on the line after each `let`.
 let releaseFrameworkURL =
-    "https://github.com/ondeinference/demucs-rs/releases/download/swift-0.1.0/DemucsFramework.xcframework.zip"
+    "https://github.com/SplitFireAI/demucs-rs/releases/download/swift-v0.1.0/DemucsFramework.xcframework.zip"
 let releaseFrameworkChecksum =
     "0000000000000000000000000000000000000000000000000000000000000000"
+
+// `make macos` (or ios, tvos, visionos) drops a locally built framework next to
+// this file; SwiftPM uses it when present and the release asset otherwise.
+let demucsFrameworkTarget: Target
+if FileManager.default.fileExists(atPath: localFrameworkAbsolutePath) {
+    demucsFrameworkTarget = .binaryTarget(
+        name: "DemucsFramework",
+        path: localFrameworkPath
+    )
+} else {
+    demucsFrameworkTarget = .binaryTarget(
+        name: "DemucsFramework",
+        url: releaseFrameworkURL,
+        checksum: releaseFrameworkChecksum
+    )
+}
 
 let package = Package(
     name: "Demucs",
@@ -24,18 +38,29 @@ let package = Package(
         .visionOS(.v1),
     ],
     products: [
-        .library(name: "Demucs", targets: ["Demucs"])
+        .library(name: "Demucs", targets: ["Demucs"]),
     ],
     targets: [
-        .binaryTarget(
-            name: "DemucsFramework",
-            url: releaseFrameworkURL,
-            checksum: releaseFrameworkChecksum
-        ),
+        demucsFrameworkTarget,
         .target(
             name: "Demucs",
-            dependencies: ["DemucsFramework"],
-            path: "Sources/Demucs"
+            dependencies: [.target(name: "DemucsFramework")],
+            path: "Sources/Demucs",
+            linkerSettings: [
+                // wgpu's Metal backend.
+                .linkedFramework("Metal"),
+                .linkedFramework("QuartzCore"),
+                .linkedFramework("CoreGraphics"),
+                .linkedFramework("IOKit", .when(platforms: [.macOS])),
+                // native-tls (weight downloads) and the Rust standard library.
+                .linkedFramework("CoreFoundation"),
+                .linkedFramework("Foundation"),
+                .linkedFramework("Security"),
+            ]
         ),
-    ]
+    ],
+    // UniFFI 0.31's generated bindings predate Swift 6's region isolation
+    // checks. The hand-written Demucs API is concurrency-safe; the generated
+    // bridge compiles in Swift 5 language mode until UniFFI updates.
+    swiftLanguageModes: [.v5]
 )

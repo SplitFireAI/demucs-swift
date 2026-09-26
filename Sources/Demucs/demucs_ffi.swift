@@ -7,8 +7,8 @@ import Foundation
 // Depending on the consumer's build setup, the low-level FFI code
 // might be in a separate module, or it might be compiled inline into
 // this module. This is a bit of light hackery to work with both.
-#if canImport(demucsFFI)
-import demucsFFI
+#if canImport(demucs_ffiFFI)
+import demucs_ffiFFI
 #endif
 
 fileprivate extension RustBuffer {
@@ -25,13 +25,13 @@ fileprivate extension RustBuffer {
     }
 
     static func from(_ ptr: UnsafeBufferPointer<UInt8>) -> RustBuffer {
-        try! rustCall { ffi_demucs_rustbuffer_from_bytes(ForeignBytes(bufferPointer: ptr), $0) }
+        try! rustCall { ffi_demucs_ffi_rustbuffer_from_bytes(ForeignBytes(bufferPointer: ptr), $0) }
     }
 
     // Frees the buffer in place.
     // The buffer must not be used after this is called.
     func deallocate() {
-        try! rustCall { ffi_demucs_rustbuffer_free(self, $0) }
+        try! rustCall { ffi_demucs_ffi_rustbuffer_free(self, $0) }
     }
 }
 
@@ -281,7 +281,7 @@ private func makeRustCall<T, E: Swift.Error>(
     _ callback: (UnsafeMutablePointer<RustCallStatus>) -> T,
     errorHandler: ((RustBuffer) throws -> E)?
 ) throws -> T {
-    uniffiEnsureDemucsInitialized()
+    uniffiEnsureDemucsFfiInitialized()
     var callStatus = RustCallStatus.init()
     let returnedVal = callback(&callStatus)
     try uniffiCheckCallStatus(callStatus: callStatus, errorHandler: errorHandler)
@@ -555,74 +555,55 @@ fileprivate struct FfiConverterString: FfiConverter {
 
 
 /**
- * Thread-safe HTDemucs source-separation engine.
+ * Holds at most one loaded model.
  *
- * Typical lifecycle from Swift:
- * ```swift
- * configureCacheDir(path: appSupportDir)          // sandboxed platforms
- * try await downloadModel(model: .fourStem, listener: dl)
- * let engine = DemucsEngine()
- * let secs = try await engine.loadModel(model: .fourStem)
- * try await engine.warmup()
- * let stems = try await engine.separate(left: l, right: r, sampleRate: 44100)
- * ```
+ * burn modules are `Send` but not `Sync` (parameters sit in a `OnceCell`), so
+ * the model lives behind a `Mutex` and each operation holds it for its whole
+ * run: loads, warmups and separations on one engine happen one at a time.
+ * The loaded model's identity is kept apart so status queries never wait on
+ * a separation.
  */
-public protocol DemucsEngineProtocol: AnyObject, Sendable {
+public protocol FfiDemucsEngineProtocol: AnyObject, Sendable {
     
-    func isLoaded() async  -> Bool
+    func isLoaded()  -> Bool
     
     /**
-     * Load a model's weights from the local cache into memory (and onto the
-     * GPU device). Errors with `NotCached` if `downloadModel` has not been
-     * run for this model. Returns the wall-clock load time in seconds.
+     * Loads a downloaded model, replacing any model already loaded. Returns
+     * the load time in seconds. Fails with `NotCached` if the weights have
+     * not been downloaded yet.
      */
-    func loadModel(model: DemucsModel) async throws  -> Double
+    func loadModel(model: FfiDemucsModel) async throws  -> Double
+    
+    func loadedModel()  -> FfiDemucsModel?
     
     /**
-     * The model currently loaded, if any.
+     * Separates stereo PCM at any sample rate. Both channels must have the
+     * same, non-zero length; pass the same buffer twice for mono.
      */
-    func loadedModel() async  -> DemucsModel?
+    func separate(left: [Float], right: [Float], sampleRate: UInt32, listener: FfiSeparationListener) async throws  -> [FfiStem]
     
     /**
-     * Separate a stereo track into stems.
-     *
-     * `left` and `right` are per-channel PCM samples (any sample rate;
-     * resampled to 44100 Hz internally). Mono input: pass the same samples
-     * for both channels. Output stems are stereo PCM at 44100 Hz.
-     *
-     * Holds the engine lock for the whole separation, so concurrent calls
-     * on one engine serialize.
-     */
-    func separate(left: [Float], right: [Float], sampleRate: UInt32) async throws  -> [StemResult]
-    
-    /**
-     * Drop the loaded model, freeing CPU and GPU memory. Returns true if a
-     * model was loaded.
+     * Frees the loaded model. Returns `false` if nothing was loaded.
      */
     func unloadModel() async  -> Bool
     
     /**
-     * Run the full pipeline once on synthetic audio to pre-compile GPU
-     * shaders and resolve autotune. Optional but recommended before the
-     * first `separate` call; takes a few seconds on first run.
+     * Runs a dummy separation so the first real one does not pay for shader
+     * compilation.
      */
     func warmup() async throws 
     
 }
 /**
- * Thread-safe HTDemucs source-separation engine.
+ * Holds at most one loaded model.
  *
- * Typical lifecycle from Swift:
- * ```swift
- * configureCacheDir(path: appSupportDir)          // sandboxed platforms
- * try await downloadModel(model: .fourStem, listener: dl)
- * let engine = DemucsEngine()
- * let secs = try await engine.loadModel(model: .fourStem)
- * try await engine.warmup()
- * let stems = try await engine.separate(left: l, right: r, sampleRate: 44100)
- * ```
+ * burn modules are `Send` but not `Sync` (parameters sit in a `OnceCell`), so
+ * the model lives behind a `Mutex` and each operation holds it for its whole
+ * run: loads, warmups and separations on one engine happen one at a time.
+ * The loaded model's identity is kept apart so status queries never wait on
+ * a separation.
  */
-open class DemucsEngine: DemucsEngineProtocol, @unchecked Sendable {
+open class FfiDemucsEngine: FfiDemucsEngineProtocol, @unchecked Sendable {
     fileprivate let handle: UInt64
 
     /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
@@ -659,12 +640,12 @@ open class DemucsEngine: DemucsEngineProtocol, @unchecked Sendable {
     @_documentation(visibility: private)
 #endif
     public func uniffiCloneHandle() -> UInt64 {
-        return try! rustCall { uniffi_demucs_fn_clone_demucsengine(self.handle, $0) }
+        return try! rustCall { uniffi_demucs_ffi_fn_clone_ffidemucsengine(self.handle, $0) }
     }
 public convenience init() {
     let handle =
         try! rustCall() {
-    uniffi_demucs_fn_constructor_demucsengine_new($0
+    uniffi_demucs_ffi_fn_constructor_ffidemucsengine_new($0
     )
 }
     self.init(unsafeFromHandle: handle)
@@ -676,116 +657,86 @@ public convenience init() {
             return
         }
 
-        try! rustCall { uniffi_demucs_fn_free_demucsengine(handle, $0) }
+        try! rustCall { uniffi_demucs_ffi_fn_free_ffidemucsengine(handle, $0) }
     }
 
     
 
     
-open func isLoaded()async  -> Bool  {
-    return
-        try!  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_demucs_fn_method_demucsengine_is_loaded(
-                    self.uniffiCloneHandle()
-                    
-                )
-            },
-            pollFunc: ffi_demucs_rust_future_poll_i8,
-            completeFunc: ffi_demucs_rust_future_complete_i8,
-            freeFunc: ffi_demucs_rust_future_free_i8,
-            liftFunc: FfiConverterBool.lift,
-            errorHandler: nil
-            
-        )
+open func isLoaded() -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_demucs_ffi_fn_method_ffidemucsengine_is_loaded(
+            self.uniffiCloneHandle(),$0
+    )
+})
 }
     
     /**
-     * Load a model's weights from the local cache into memory (and onto the
-     * GPU device). Errors with `NotCached` if `downloadModel` has not been
-     * run for this model. Returns the wall-clock load time in seconds.
+     * Loads a downloaded model, replacing any model already loaded. Returns
+     * the load time in seconds. Fails with `NotCached` if the weights have
+     * not been downloaded yet.
      */
-open func loadModel(model: DemucsModel)async throws  -> Double  {
+open func loadModel(model: FfiDemucsModel)async throws  -> Double  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_demucs_fn_method_demucsengine_load_model(
+                uniffi_demucs_ffi_fn_method_ffidemucsengine_load_model(
                     self.uniffiCloneHandle(),
-                    FfiConverterTypeDemucsModel_lower(model)
+                    FfiConverterTypeFfiDemucsModel_lower(model)
                 )
             },
-            pollFunc: ffi_demucs_rust_future_poll_f64,
-            completeFunc: ffi_demucs_rust_future_complete_f64,
-            freeFunc: ffi_demucs_rust_future_free_f64,
+            pollFunc: ffi_demucs_ffi_rust_future_poll_f64,
+            completeFunc: ffi_demucs_ffi_rust_future_complete_f64,
+            freeFunc: ffi_demucs_ffi_rust_future_free_f64,
             liftFunc: FfiConverterDouble.lift,
-            errorHandler: FfiConverterTypeDemucsFfiError_lift
+            errorHandler: FfiConverterTypeFfiDemucsError_lift
         )
 }
     
-    /**
-     * The model currently loaded, if any.
-     */
-open func loadedModel()async  -> DemucsModel?  {
-    return
-        try!  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_demucs_fn_method_demucsengine_loaded_model(
-                    self.uniffiCloneHandle()
-                    
-                )
-            },
-            pollFunc: ffi_demucs_rust_future_poll_rust_buffer,
-            completeFunc: ffi_demucs_rust_future_complete_rust_buffer,
-            freeFunc: ffi_demucs_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterOptionTypeDemucsModel.lift,
-            errorHandler: nil
-            
-        )
+open func loadedModel() -> FfiDemucsModel?  {
+    return try!  FfiConverterOptionTypeFfiDemucsModel.lift(try! rustCall() {
+    uniffi_demucs_ffi_fn_method_ffidemucsengine_loaded_model(
+            self.uniffiCloneHandle(),$0
+    )
+})
 }
     
     /**
-     * Separate a stereo track into stems.
-     *
-     * `left` and `right` are per-channel PCM samples (any sample rate;
-     * resampled to 44100 Hz internally). Mono input: pass the same samples
-     * for both channels. Output stems are stereo PCM at 44100 Hz.
-     *
-     * Holds the engine lock for the whole separation, so concurrent calls
-     * on one engine serialize.
+     * Separates stereo PCM at any sample rate. Both channels must have the
+     * same, non-zero length; pass the same buffer twice for mono.
      */
-open func separate(left: [Float], right: [Float], sampleRate: UInt32)async throws  -> [StemResult]  {
+open func separate(left: [Float], right: [Float], sampleRate: UInt32, listener: FfiSeparationListener)async throws  -> [FfiStem]  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_demucs_fn_method_demucsengine_separate(
+                uniffi_demucs_ffi_fn_method_ffidemucsengine_separate(
                     self.uniffiCloneHandle(),
-                    FfiConverterSequenceFloat.lower(left),FfiConverterSequenceFloat.lower(right),FfiConverterUInt32.lower(sampleRate)
+                    FfiConverterSequenceFloat.lower(left),FfiConverterSequenceFloat.lower(right),FfiConverterUInt32.lower(sampleRate),FfiConverterCallbackInterfaceFfiSeparationListener_lower(listener)
                 )
             },
-            pollFunc: ffi_demucs_rust_future_poll_rust_buffer,
-            completeFunc: ffi_demucs_rust_future_complete_rust_buffer,
-            freeFunc: ffi_demucs_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterSequenceTypeStemResult.lift,
-            errorHandler: FfiConverterTypeDemucsFfiError_lift
+            pollFunc: ffi_demucs_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_demucs_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_demucs_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeFfiStem.lift,
+            errorHandler: FfiConverterTypeFfiDemucsError_lift
         )
 }
     
     /**
-     * Drop the loaded model, freeing CPU and GPU memory. Returns true if a
-     * model was loaded.
+     * Frees the loaded model. Returns `false` if nothing was loaded.
      */
 open func unloadModel()async  -> Bool  {
     return
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_demucs_fn_method_demucsengine_unload_model(
+                uniffi_demucs_ffi_fn_method_ffidemucsengine_unload_model(
                     self.uniffiCloneHandle()
                     
                 )
             },
-            pollFunc: ffi_demucs_rust_future_poll_i8,
-            completeFunc: ffi_demucs_rust_future_complete_i8,
-            freeFunc: ffi_demucs_rust_future_free_i8,
+            pollFunc: ffi_demucs_ffi_rust_future_poll_i8,
+            completeFunc: ffi_demucs_ffi_rust_future_complete_i8,
+            freeFunc: ffi_demucs_ffi_rust_future_free_i8,
             liftFunc: FfiConverterBool.lift,
             errorHandler: nil
             
@@ -793,24 +744,23 @@ open func unloadModel()async  -> Bool  {
 }
     
     /**
-     * Run the full pipeline once on synthetic audio to pre-compile GPU
-     * shaders and resolve autotune. Optional but recommended before the
-     * first `separate` call; takes a few seconds on first run.
+     * Runs a dummy separation so the first real one does not pay for shader
+     * compilation.
      */
 open func warmup()async throws   {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_demucs_fn_method_demucsengine_warmup(
+                uniffi_demucs_ffi_fn_method_ffidemucsengine_warmup(
                     self.uniffiCloneHandle()
                     
                 )
             },
-            pollFunc: ffi_demucs_rust_future_poll_void,
-            completeFunc: ffi_demucs_rust_future_complete_void,
-            freeFunc: ffi_demucs_rust_future_free_void,
+            pollFunc: ffi_demucs_ffi_rust_future_poll_void,
+            completeFunc: ffi_demucs_ffi_rust_future_complete_void,
+            freeFunc: ffi_demucs_ffi_rust_future_free_void,
             liftFunc: { $0 },
-            errorHandler: FfiConverterTypeDemucsFfiError_lift
+            errorHandler: FfiConverterTypeFfiDemucsError_lift
         )
 }
     
@@ -822,24 +772,24 @@ open func warmup()async throws   {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public struct FfiConverterTypeDemucsEngine: FfiConverter {
+public struct FfiConverterTypeFfiDemucsEngine: FfiConverter {
     typealias FfiType = UInt64
-    typealias SwiftType = DemucsEngine
+    typealias SwiftType = FfiDemucsEngine
 
-    public static func lift(_ handle: UInt64) throws -> DemucsEngine {
-        return DemucsEngine(unsafeFromHandle: handle)
+    public static func lift(_ handle: UInt64) throws -> FfiDemucsEngine {
+        return FfiDemucsEngine(unsafeFromHandle: handle)
     }
 
-    public static func lower(_ value: DemucsEngine) -> UInt64 {
+    public static func lower(_ value: FfiDemucsEngine) -> UInt64 {
         return value.uniffiCloneHandle()
     }
 
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DemucsEngine {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiDemucsEngine {
         let handle: UInt64 = try readInt(&buf)
         return try lift(handle)
     }
 
-    public static func write(_ value: DemucsEngine, into buf: inout [UInt8]) {
+    public static func write(_ value: FfiDemucsEngine, into buf: inout [UInt8]) {
         writeInt(&buf, lower(value))
     }
 }
@@ -848,48 +798,39 @@ public struct FfiConverterTypeDemucsEngine: FfiConverter {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeDemucsEngine_lift(_ handle: UInt64) throws -> DemucsEngine {
-    return try FfiConverterTypeDemucsEngine.lift(handle)
+public func FfiConverterTypeFfiDemucsEngine_lift(_ handle: UInt64) throws -> FfiDemucsEngine {
+    return try FfiConverterTypeFfiDemucsEngine.lift(handle)
 }
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeDemucsEngine_lower(_ value: DemucsEngine) -> UInt64 {
-    return FfiConverterTypeDemucsEngine.lower(value)
+public func FfiConverterTypeFfiDemucsEngine_lower(_ value: FfiDemucsEngine) -> UInt64 {
+    return FfiConverterTypeFfiDemucsEngine.lower(value)
 }
 
 
 
 
-/**
- * Progress payload for weight downloads.
- */
-public struct DownloadProgress: Equatable, Hashable {
+public struct FfiDownloadProgress: Equatable, Hashable {
     public var downloadedBytes: UInt64
     /**
-     * 0 when the server did not report a Content-Length.
+     * From `Content-Length`, or the model's nominal size when the server
+     * does not send one.
      */
     public var totalBytes: UInt64
-    /**
-     * 0.0–1.0, or 0.0 when the total is unknown.
-     */
     public var fraction: Double
-    public var done: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
     public init(downloadedBytes: UInt64, 
         /**
-         * 0 when the server did not report a Content-Length.
-         */totalBytes: UInt64, 
-        /**
-         * 0.0–1.0, or 0.0 when the total is unknown.
-         */fraction: Double, done: Bool) {
+         * From `Content-Length`, or the model's nominal size when the server
+         * does not send one.
+         */totalBytes: UInt64, fraction: Double) {
         self.downloadedBytes = downloadedBytes
         self.totalBytes = totalBytes
         self.fraction = fraction
-        self.done = done
     }
 
     
@@ -898,28 +839,26 @@ public struct DownloadProgress: Equatable, Hashable {
 }
 
 #if compiler(>=6)
-extension DownloadProgress: Sendable {}
+extension FfiDownloadProgress: Sendable {}
 #endif
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public struct FfiConverterTypeDownloadProgress: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DownloadProgress {
+public struct FfiConverterTypeFfiDownloadProgress: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiDownloadProgress {
         return
-            try DownloadProgress(
+            try FfiDownloadProgress(
                 downloadedBytes: FfiConverterUInt64.read(from: &buf), 
                 totalBytes: FfiConverterUInt64.read(from: &buf), 
-                fraction: FfiConverterDouble.read(from: &buf), 
-                done: FfiConverterBool.read(from: &buf)
+                fraction: FfiConverterDouble.read(from: &buf)
         )
     }
 
-    public static func write(_ value: DownloadProgress, into buf: inout [UInt8]) {
+    public static func write(_ value: FfiDownloadProgress, into buf: inout [UInt8]) {
         FfiConverterUInt64.write(value.downloadedBytes, into: &buf)
         FfiConverterUInt64.write(value.totalBytes, into: &buf)
         FfiConverterDouble.write(value.fraction, into: &buf)
-        FfiConverterBool.write(value.done, into: &buf)
     }
 }
 
@@ -927,46 +866,35 @@ public struct FfiConverterTypeDownloadProgress: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeDownloadProgress_lift(_ buf: RustBuffer) throws -> DownloadProgress {
-    return try FfiConverterTypeDownloadProgress.lift(buf)
+public func FfiConverterTypeFfiDownloadProgress_lift(_ buf: RustBuffer) throws -> FfiDownloadProgress {
+    return try FfiConverterTypeFfiDownloadProgress.lift(buf)
 }
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeDownloadProgress_lower(_ value: DownloadProgress) -> RustBuffer {
-    return FfiConverterTypeDownloadProgress.lower(value)
+public func FfiConverterTypeFfiDownloadProgress_lower(_ value: FfiDownloadProgress) -> RustBuffer {
+    return FfiConverterTypeFfiDownloadProgress.lower(value)
 }
 
 
-/**
- * Descriptive metadata for a model variant.
- */
-public struct ModelMetadata: Equatable, Hashable {
+public struct FfiModelMetadata: Equatable, Hashable {
+    public var model: FfiDemucsModel
     public var id: String
     public var label: String
     public var description: String
-    /**
-     * Safetensors weight file name, e.g. "htdemucs.safetensors".
-     */
-    public var filename: String
     public var sizeMb: UInt32
-    public var stems: [StemKind]
-    public var downloadUrl: String
+    public var stems: [FfiStemKind]
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(id: String, label: String, description: String, 
-        /**
-         * Safetensors weight file name, e.g. "htdemucs.safetensors".
-         */filename: String, sizeMb: UInt32, stems: [StemKind], downloadUrl: String) {
+    public init(model: FfiDemucsModel, id: String, label: String, description: String, sizeMb: UInt32, stems: [FfiStemKind]) {
+        self.model = model
         self.id = id
         self.label = label
         self.description = description
-        self.filename = filename
         self.sizeMb = sizeMb
         self.stems = stems
-        self.downloadUrl = downloadUrl
     }
 
     
@@ -975,34 +903,32 @@ public struct ModelMetadata: Equatable, Hashable {
 }
 
 #if compiler(>=6)
-extension ModelMetadata: Sendable {}
+extension FfiModelMetadata: Sendable {}
 #endif
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public struct FfiConverterTypeModelMetadata: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ModelMetadata {
+public struct FfiConverterTypeFfiModelMetadata: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiModelMetadata {
         return
-            try ModelMetadata(
+            try FfiModelMetadata(
+                model: FfiConverterTypeFfiDemucsModel.read(from: &buf), 
                 id: FfiConverterString.read(from: &buf), 
                 label: FfiConverterString.read(from: &buf), 
                 description: FfiConverterString.read(from: &buf), 
-                filename: FfiConverterString.read(from: &buf), 
                 sizeMb: FfiConverterUInt32.read(from: &buf), 
-                stems: FfiConverterSequenceTypeStemKind.read(from: &buf), 
-                downloadUrl: FfiConverterString.read(from: &buf)
+                stems: FfiConverterSequenceTypeFfiStemKind.read(from: &buf)
         )
     }
 
-    public static func write(_ value: ModelMetadata, into buf: inout [UInt8]) {
+    public static func write(_ value: FfiModelMetadata, into buf: inout [UInt8]) {
+        FfiConverterTypeFfiDemucsModel.write(value.model, into: &buf)
         FfiConverterString.write(value.id, into: &buf)
         FfiConverterString.write(value.label, into: &buf)
         FfiConverterString.write(value.description, into: &buf)
-        FfiConverterString.write(value.filename, into: &buf)
         FfiConverterUInt32.write(value.sizeMb, into: &buf)
-        FfiConverterSequenceTypeStemKind.write(value.stems, into: &buf)
-        FfiConverterString.write(value.downloadUrl, into: &buf)
+        FfiConverterSequenceTypeFfiStemKind.write(value.stems, into: &buf)
     }
 }
 
@@ -1010,43 +936,28 @@ public struct FfiConverterTypeModelMetadata: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeModelMetadata_lift(_ buf: RustBuffer) throws -> ModelMetadata {
-    return try FfiConverterTypeModelMetadata.lift(buf)
+public func FfiConverterTypeFfiModelMetadata_lift(_ buf: RustBuffer) throws -> FfiModelMetadata {
+    return try FfiConverterTypeFfiModelMetadata.lift(buf)
 }
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeModelMetadata_lower(_ value: ModelMetadata) -> RustBuffer {
-    return FfiConverterTypeModelMetadata.lower(value)
+public func FfiConverterTypeFfiModelMetadata_lower(_ value: FfiModelMetadata) -> RustBuffer {
+    return FfiConverterTypeFfiModelMetadata.lower(value)
 }
 
 
-/**
- * Coarse separation progress derived from chunk/stem counters.
- */
-public struct SeparationProgress: Equatable, Hashable {
-    /**
-     * 0.0–1.0 overall fraction.
-     */
+public struct FfiSeparationProgress: Equatable, Hashable {
     public var fraction: Double
-    /**
-     * 0-based index of the chunk currently in flight.
-     */
-    public var currentChunk: UInt64
+    public var chunkIndex: UInt64
     public var totalChunks: UInt64
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(
-        /**
-         * 0.0–1.0 overall fraction.
-         */fraction: Double, 
-        /**
-         * 0-based index of the chunk currently in flight.
-         */currentChunk: UInt64, totalChunks: UInt64) {
+    public init(fraction: Double, chunkIndex: UInt64, totalChunks: UInt64) {
         self.fraction = fraction
-        self.currentChunk = currentChunk
+        self.chunkIndex = chunkIndex
         self.totalChunks = totalChunks
     }
 
@@ -1056,25 +967,25 @@ public struct SeparationProgress: Equatable, Hashable {
 }
 
 #if compiler(>=6)
-extension SeparationProgress: Sendable {}
+extension FfiSeparationProgress: Sendable {}
 #endif
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public struct FfiConverterTypeSeparationProgress: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SeparationProgress {
+public struct FfiConverterTypeFfiSeparationProgress: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiSeparationProgress {
         return
-            try SeparationProgress(
+            try FfiSeparationProgress(
                 fraction: FfiConverterDouble.read(from: &buf), 
-                currentChunk: FfiConverterUInt64.read(from: &buf), 
+                chunkIndex: FfiConverterUInt64.read(from: &buf), 
                 totalChunks: FfiConverterUInt64.read(from: &buf)
         )
     }
 
-    public static func write(_ value: SeparationProgress, into buf: inout [UInt8]) {
+    public static func write(_ value: FfiSeparationProgress, into buf: inout [UInt8]) {
         FfiConverterDouble.write(value.fraction, into: &buf)
-        FfiConverterUInt64.write(value.currentChunk, into: &buf)
+        FfiConverterUInt64.write(value.chunkIndex, into: &buf)
         FfiConverterUInt64.write(value.totalChunks, into: &buf)
     }
 }
@@ -1083,29 +994,30 @@ public struct FfiConverterTypeSeparationProgress: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeSeparationProgress_lift(_ buf: RustBuffer) throws -> SeparationProgress {
-    return try FfiConverterTypeSeparationProgress.lift(buf)
+public func FfiConverterTypeFfiSeparationProgress_lift(_ buf: RustBuffer) throws -> FfiSeparationProgress {
+    return try FfiConverterTypeFfiSeparationProgress.lift(buf)
 }
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeSeparationProgress_lower(_ value: SeparationProgress) -> RustBuffer {
-    return FfiConverterTypeSeparationProgress.lower(value)
+public func FfiConverterTypeFfiSeparationProgress_lower(_ value: FfiSeparationProgress) -> RustBuffer {
+    return FfiConverterTypeFfiSeparationProgress.lower(value)
 }
 
 
 /**
- * One separated stem: interleaved-free stereo PCM at 44100 Hz.
+ * One separated source. `left` and `right` are at the input sample rate and
+ * have the same length as the input channels.
  */
-public struct StemResult: Equatable, Hashable {
-    public var kind: StemKind
+public struct FfiStem: Equatable, Hashable {
+    public var kind: FfiStemKind
     public var left: [Float]
     public var right: [Float]
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(kind: StemKind, left: [Float], right: [Float]) {
+    public init(kind: FfiStemKind, left: [Float], right: [Float]) {
         self.kind = kind
         self.left = left
         self.right = right
@@ -1117,24 +1029,24 @@ public struct StemResult: Equatable, Hashable {
 }
 
 #if compiler(>=6)
-extension StemResult: Sendable {}
+extension FfiStem: Sendable {}
 #endif
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public struct FfiConverterTypeStemResult: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> StemResult {
+public struct FfiConverterTypeFfiStem: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiStem {
         return
-            try StemResult(
-                kind: FfiConverterTypeStemKind.read(from: &buf), 
+            try FfiStem(
+                kind: FfiConverterTypeFfiStemKind.read(from: &buf), 
                 left: FfiConverterSequenceFloat.read(from: &buf), 
                 right: FfiConverterSequenceFloat.read(from: &buf)
         )
     }
 
-    public static func write(_ value: StemResult, into buf: inout [UInt8]) {
-        FfiConverterTypeStemKind.write(value.kind, into: &buf)
+    public static func write(_ value: FfiStem, into buf: inout [UInt8]) {
+        FfiConverterTypeFfiStemKind.write(value.kind, into: &buf)
         FfiConverterSequenceFloat.write(value.left, into: &buf)
         FfiConverterSequenceFloat.write(value.right, into: &buf)
     }
@@ -1144,43 +1056,33 @@ public struct FfiConverterTypeStemResult: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeStemResult_lift(_ buf: RustBuffer) throws -> StemResult {
-    return try FfiConverterTypeStemResult.lift(buf)
+public func FfiConverterTypeFfiStem_lift(_ buf: RustBuffer) throws -> FfiStem {
+    return try FfiConverterTypeFfiStem.lift(buf)
 }
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeStemResult_lower(_ value: StemResult) -> RustBuffer {
-    return FfiConverterTypeStemResult.lower(value)
+public func FfiConverterTypeFfiStem_lower(_ value: FfiStem) -> RustBuffer {
+    return FfiConverterTypeFfiStem.lower(value)
 }
 
 
-/**
- * Errors surfaced across the FFI boundary.
- */
-public enum DemucsFfiError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
+public enum FfiDemucsError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
 
     
     
-    case NoModelLoaded
-    case AlreadyLoaded(modelId: String
-    )
-    case Weights(reason: String
-    )
-    case Dsp(reason: String
-    )
-    case Tensor(reason: String
-    )
-    case Internal(reason: String
-    )
     case Cancelled
-    case NotCached(reason: String
+    case NotLoaded
+    case NotCached(modelId: String
+    )
+    case InvalidInput(reason: String
+    )
+    case Download(reason: String
     )
     case Io(reason: String
     )
-    case NoCacheDir
-    case Download(reason: String
+    case Inference(reason: String
     )
 
     
@@ -1195,47 +1097,37 @@ public enum DemucsFfiError: Swift.Error, Equatable, Hashable, Foundation.Localiz
 }
 
 #if compiler(>=6)
-extension DemucsFfiError: Sendable {}
+extension FfiDemucsError: Sendable {}
 #endif
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public struct FfiConverterTypeDemucsFfiError: FfiConverterRustBuffer {
-    typealias SwiftType = DemucsFfiError
+public struct FfiConverterTypeFfiDemucsError: FfiConverterRustBuffer {
+    typealias SwiftType = FfiDemucsError
 
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DemucsFfiError {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiDemucsError {
         let variant: Int32 = try readInt(&buf)
         switch variant {
 
         
 
         
-        case 1: return .NoModelLoaded
-        case 2: return .AlreadyLoaded(
+        case 1: return .Cancelled
+        case 2: return .NotLoaded
+        case 3: return .NotCached(
             modelId: try FfiConverterString.read(from: &buf)
             )
-        case 3: return .Weights(
+        case 4: return .InvalidInput(
             reason: try FfiConverterString.read(from: &buf)
             )
-        case 4: return .Dsp(
+        case 5: return .Download(
             reason: try FfiConverterString.read(from: &buf)
             )
-        case 5: return .Tensor(
+        case 6: return .Io(
             reason: try FfiConverterString.read(from: &buf)
             )
-        case 6: return .Internal(
-            reason: try FfiConverterString.read(from: &buf)
-            )
-        case 7: return .Cancelled
-        case 8: return .NotCached(
-            reason: try FfiConverterString.read(from: &buf)
-            )
-        case 9: return .Io(
-            reason: try FfiConverterString.read(from: &buf)
-            )
-        case 10: return .NoCacheDir
-        case 11: return .Download(
+        case 7: return .Inference(
             reason: try FfiConverterString.read(from: &buf)
             )
 
@@ -1243,62 +1135,43 @@ public struct FfiConverterTypeDemucsFfiError: FfiConverterRustBuffer {
         }
     }
 
-    public static func write(_ value: DemucsFfiError, into buf: inout [UInt8]) {
+    public static func write(_ value: FfiDemucsError, into buf: inout [UInt8]) {
         switch value {
 
         
 
         
         
-        case .NoModelLoaded:
+        case .Cancelled:
             writeInt(&buf, Int32(1))
         
         
-        case let .AlreadyLoaded(modelId):
+        case .NotLoaded:
             writeInt(&buf, Int32(2))
+        
+        
+        case let .NotCached(modelId):
+            writeInt(&buf, Int32(3))
             FfiConverterString.write(modelId, into: &buf)
             
         
-        case let .Weights(reason):
-            writeInt(&buf, Int32(3))
-            FfiConverterString.write(reason, into: &buf)
-            
-        
-        case let .Dsp(reason):
+        case let .InvalidInput(reason):
             writeInt(&buf, Int32(4))
             FfiConverterString.write(reason, into: &buf)
             
         
-        case let .Tensor(reason):
+        case let .Download(reason):
             writeInt(&buf, Int32(5))
             FfiConverterString.write(reason, into: &buf)
             
         
-        case let .Internal(reason):
+        case let .Io(reason):
             writeInt(&buf, Int32(6))
             FfiConverterString.write(reason, into: &buf)
             
         
-        case .Cancelled:
+        case let .Inference(reason):
             writeInt(&buf, Int32(7))
-        
-        
-        case let .NotCached(reason):
-            writeInt(&buf, Int32(8))
-            FfiConverterString.write(reason, into: &buf)
-            
-        
-        case let .Io(reason):
-            writeInt(&buf, Int32(9))
-            FfiConverterString.write(reason, into: &buf)
-            
-        
-        case .NoCacheDir:
-            writeInt(&buf, Int32(10))
-        
-        
-        case let .Download(reason):
-            writeInt(&buf, Int32(11))
             FfiConverterString.write(reason, into: &buf)
             
         }
@@ -1309,38 +1182,32 @@ public struct FfiConverterTypeDemucsFfiError: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeDemucsFfiError_lift(_ buf: RustBuffer) throws -> DemucsFfiError {
-    return try FfiConverterTypeDemucsFfiError.lift(buf)
+public func FfiConverterTypeFfiDemucsError_lift(_ buf: RustBuffer) throws -> FfiDemucsError {
+    return try FfiConverterTypeFfiDemucsError.lift(buf)
 }
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeDemucsFfiError_lower(_ value: DemucsFfiError) -> RustBuffer {
-    return FfiConverterTypeDemucsFfiError.lower(value)
+public func FfiConverterTypeFfiDemucsError_lower(_ value: FfiDemucsError) -> RustBuffer {
+    return FfiConverterTypeFfiDemucsError.lower(value)
 }
 
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
- * Which HTDemucs variant to load.
+ * Which model variant to download or load.
+ *
+ * `FineTuned` runs one sub-model per requested stem, so asking for fewer
+ * stems is proportionally faster. It only knows drums, bass, other and
+ * vocals; an empty list or any other stem is rejected at load time.
  */
 
-public enum DemucsModel: Equatable, Hashable {
+public enum FfiDemucsModel: Equatable, Hashable {
     
-    /**
-     * htdemucs — 4 stems, balanced speed and quality (~84 MB).
-     */
     case fourStem
-    /**
-     * htdemucs_6s — 6 stems, adds guitar and piano (~84 MB).
-     */
     case sixStem
-    /**
-     * htdemucs_ft — fine-tuned, best quality, one sub-model per requested
-     * stem so inference time scales with `stems.len()` (~333 MB).
-     */
-    case fineTuned(stems: [StemKind]
+    case fineTuned(stems: [FfiStemKind]
     )
 
 
@@ -1350,16 +1217,16 @@ public enum DemucsModel: Equatable, Hashable {
 }
 
 #if compiler(>=6)
-extension DemucsModel: Sendable {}
+extension FfiDemucsModel: Sendable {}
 #endif
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public struct FfiConverterTypeDemucsModel: FfiConverterRustBuffer {
-    typealias SwiftType = DemucsModel
+public struct FfiConverterTypeFfiDemucsModel: FfiConverterRustBuffer {
+    typealias SwiftType = FfiDemucsModel
 
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DemucsModel {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiDemucsModel {
         let variant: Int32 = try readInt(&buf)
         switch variant {
         
@@ -1367,14 +1234,14 @@ public struct FfiConverterTypeDemucsModel: FfiConverterRustBuffer {
         
         case 2: return .sixStem
         
-        case 3: return .fineTuned(stems: try FfiConverterSequenceTypeStemKind.read(from: &buf)
+        case 3: return .fineTuned(stems: try FfiConverterSequenceTypeFfiStemKind.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
 
-    public static func write(_ value: DemucsModel, into buf: inout [UInt8]) {
+    public static func write(_ value: FfiDemucsModel, into buf: inout [UInt8]) {
         switch value {
         
         
@@ -1388,7 +1255,7 @@ public struct FfiConverterTypeDemucsModel: FfiConverterRustBuffer {
         
         case let .fineTuned(stems):
             writeInt(&buf, Int32(3))
-            FfiConverterSequenceTypeStemKind.write(stems, into: &buf)
+            FfiConverterSequenceTypeFfiStemKind.write(stems, into: &buf)
             
         }
     }
@@ -1398,25 +1265,22 @@ public struct FfiConverterTypeDemucsModel: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeDemucsModel_lift(_ buf: RustBuffer) throws -> DemucsModel {
-    return try FfiConverterTypeDemucsModel.lift(buf)
+public func FfiConverterTypeFfiDemucsModel_lift(_ buf: RustBuffer) throws -> FfiDemucsModel {
+    return try FfiConverterTypeFfiDemucsModel.lift(buf)
 }
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeDemucsModel_lower(_ value: DemucsModel) -> RustBuffer {
-    return FfiConverterTypeDemucsModel.lower(value)
+public func FfiConverterTypeFfiDemucsModel_lower(_ value: FfiDemucsModel) -> RustBuffer {
+    return FfiConverterTypeFfiDemucsModel.lower(value)
 }
 
 
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
-/**
- * A single separable audio source.
- */
 
-public enum StemKind: Equatable, Hashable {
+public enum FfiStemKind: Equatable, Hashable {
     
     case drums
     case bass
@@ -1432,16 +1296,16 @@ public enum StemKind: Equatable, Hashable {
 }
 
 #if compiler(>=6)
-extension StemKind: Sendable {}
+extension FfiStemKind: Sendable {}
 #endif
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public struct FfiConverterTypeStemKind: FfiConverterRustBuffer {
-    typealias SwiftType = StemKind
+public struct FfiConverterTypeFfiStemKind: FfiConverterRustBuffer {
+    typealias SwiftType = FfiStemKind
 
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> StemKind {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiStemKind {
         let variant: Int32 = try readInt(&buf)
         switch variant {
         
@@ -1461,7 +1325,7 @@ public struct FfiConverterTypeStemKind: FfiConverterRustBuffer {
         }
     }
 
-    public static func write(_ value: StemKind, into buf: inout [UInt8]) {
+    public static func write(_ value: FfiStemKind, into buf: inout [UInt8]) {
         switch value {
         
         
@@ -1496,15 +1360,15 @@ public struct FfiConverterTypeStemKind: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeStemKind_lift(_ buf: RustBuffer) throws -> StemKind {
-    return try FfiConverterTypeStemKind.lift(buf)
+public func FfiConverterTypeFfiStemKind_lift(_ buf: RustBuffer) throws -> FfiStemKind {
+    return try FfiConverterTypeFfiStemKind.lift(buf)
 }
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeStemKind_lower(_ value: StemKind) -> RustBuffer {
-    return FfiConverterTypeStemKind.lower(value)
+public func FfiConverterTypeFfiStemKind_lower(_ value: FfiStemKind) -> RustBuffer {
+    return FfiConverterTypeFfiStemKind.lower(value)
 }
 
 
@@ -1512,37 +1376,36 @@ public func FfiConverterTypeStemKind_lower(_ value: StemKind) -> RustBuffer {
 
 
 /**
- * Receives download progress. Return true to continue, false to cancel —
- * the partial file is deleted and `download_model` returns `Cancelled`.
+ * Called from a background thread. Return `false` to cancel the download.
  */
-public protocol DownloadProgressListener: AnyObject, Sendable {
+public protocol FfiDownloadListener: AnyObject, Sendable {
     
-    func onProgress(progress: DownloadProgress)  -> Bool
+    func onProgress(progress: FfiDownloadProgress)  -> Bool
     
 }
 
 
 // Put the implementation in a struct so we don't pollute the top-level namespace
-fileprivate struct UniffiCallbackInterfaceDownloadProgressListener {
+fileprivate struct UniffiCallbackInterfaceFfiDownloadListener {
 
     // Create the VTable using a series of closures.
     // Swift automatically converts these into C callback functions.
     //
     // This creates 1-element array, since this seems to be the only way to construct a const
     // pointer that we can pass to the Rust code.
-    static let vtable: [UniffiVTableCallbackInterfaceDownloadProgressListener] = [UniffiVTableCallbackInterfaceDownloadProgressListener(
+    static let vtable: [UniffiVTableCallbackInterfaceFfiDownloadListener] = [UniffiVTableCallbackInterfaceFfiDownloadListener(
         uniffiFree: { (uniffiHandle: UInt64) -> () in
             do {
-                try FfiConverterCallbackInterfaceDownloadProgressListener.handleMap.remove(handle: uniffiHandle)
+                try FfiConverterCallbackInterfaceFfiDownloadListener.handleMap.remove(handle: uniffiHandle)
             } catch {
-                print("Uniffi callback interface DownloadProgressListener: handle missing in uniffiFree")
+                print("Uniffi callback interface FfiDownloadListener: handle missing in uniffiFree")
             }
         },
         uniffiClone: { (uniffiHandle: UInt64) -> UInt64 in
             do {
-                return try FfiConverterCallbackInterfaceDownloadProgressListener.handleMap.clone(handle: uniffiHandle)
+                return try FfiConverterCallbackInterfaceFfiDownloadListener.handleMap.clone(handle: uniffiHandle)
             } catch {
-                fatalError("Uniffi callback interface DownloadProgressListener: handle missing in uniffiClone")
+                fatalError("Uniffi callback interface FfiDownloadListener: handle missing in uniffiClone")
             }
         },
         onProgress: { (
@@ -1553,11 +1416,11 @@ fileprivate struct UniffiCallbackInterfaceDownloadProgressListener {
         ) in
             let makeCall = {
                 () throws -> Bool in
-                guard let uniffiObj = try? FfiConverterCallbackInterfaceDownloadProgressListener.handleMap.get(handle: uniffiHandle) else {
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceFfiDownloadListener.handleMap.get(handle: uniffiHandle) else {
                     throw UniffiInternalError.unexpectedStaleHandle
                 }
                 return uniffiObj.onProgress(
-                     progress: try FfiConverterTypeDownloadProgress_lift(progress)
+                     progress: try FfiConverterTypeFfiDownloadProgress_lift(progress)
                 )
             }
 
@@ -1572,23 +1435,23 @@ fileprivate struct UniffiCallbackInterfaceDownloadProgressListener {
     )]
 }
 
-private func uniffiCallbackInitDownloadProgressListener() {
-    uniffi_demucs_fn_init_callback_vtable_downloadprogresslistener(UniffiCallbackInterfaceDownloadProgressListener.vtable)
+private func uniffiCallbackInitFfiDownloadListener() {
+    uniffi_demucs_ffi_fn_init_callback_vtable_ffidownloadlistener(UniffiCallbackInterfaceFfiDownloadListener.vtable)
 }
 
 // FfiConverter protocol for callback interfaces
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-fileprivate struct FfiConverterCallbackInterfaceDownloadProgressListener {
-    fileprivate static let handleMap = UniffiHandleMap<DownloadProgressListener>()
+fileprivate struct FfiConverterCallbackInterfaceFfiDownloadListener {
+    fileprivate static let handleMap = UniffiHandleMap<FfiDownloadListener>()
 }
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-extension FfiConverterCallbackInterfaceDownloadProgressListener : FfiConverter {
-    typealias SwiftType = DownloadProgressListener
+extension FfiConverterCallbackInterfaceFfiDownloadListener : FfiConverter {
+    typealias SwiftType = FfiDownloadListener
     typealias FfiType = UInt64
 
 #if swift(>=5.8)
@@ -1625,54 +1488,53 @@ extension FfiConverterCallbackInterfaceDownloadProgressListener : FfiConverter {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterCallbackInterfaceDownloadProgressListener_lift(_ handle: UInt64) throws -> DownloadProgressListener {
-    return try FfiConverterCallbackInterfaceDownloadProgressListener.lift(handle)
+public func FfiConverterCallbackInterfaceFfiDownloadListener_lift(_ handle: UInt64) throws -> FfiDownloadListener {
+    return try FfiConverterCallbackInterfaceFfiDownloadListener.lift(handle)
 }
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterCallbackInterfaceDownloadProgressListener_lower(_ v: DownloadProgressListener) -> UInt64 {
-    return FfiConverterCallbackInterfaceDownloadProgressListener.lower(v)
+public func FfiConverterCallbackInterfaceFfiDownloadListener_lower(_ v: FfiDownloadListener) -> UInt64 {
+    return FfiConverterCallbackInterfaceFfiDownloadListener.lower(v)
 }
 
 
 
 
 /**
- * Receives coarse progress during separation.
- *
- * Called from the inference task; keep the callback fast. Return true to
- * continue, false to cancel — the engine then returns `Cancelled`.
+ * Called from a background thread. Return `false` to cancel; cancellation
+ * takes effect at the next chunk boundary (every ~7.8 s of audio), so audio
+ * short enough to fit in one chunk always runs to completion.
  */
-public protocol SeparationProgressListener: AnyObject, Sendable {
+public protocol FfiSeparationListener: AnyObject, Sendable {
     
-    func onProgress(progress: SeparationProgress)  -> Bool
+    func onProgress(progress: FfiSeparationProgress)  -> Bool
     
 }
 
 
 // Put the implementation in a struct so we don't pollute the top-level namespace
-fileprivate struct UniffiCallbackInterfaceSeparationProgressListener {
+fileprivate struct UniffiCallbackInterfaceFfiSeparationListener {
 
     // Create the VTable using a series of closures.
     // Swift automatically converts these into C callback functions.
     //
     // This creates 1-element array, since this seems to be the only way to construct a const
     // pointer that we can pass to the Rust code.
-    static let vtable: [UniffiVTableCallbackInterfaceSeparationProgressListener] = [UniffiVTableCallbackInterfaceSeparationProgressListener(
+    static let vtable: [UniffiVTableCallbackInterfaceFfiSeparationListener] = [UniffiVTableCallbackInterfaceFfiSeparationListener(
         uniffiFree: { (uniffiHandle: UInt64) -> () in
             do {
-                try FfiConverterCallbackInterfaceSeparationProgressListener.handleMap.remove(handle: uniffiHandle)
+                try FfiConverterCallbackInterfaceFfiSeparationListener.handleMap.remove(handle: uniffiHandle)
             } catch {
-                print("Uniffi callback interface SeparationProgressListener: handle missing in uniffiFree")
+                print("Uniffi callback interface FfiSeparationListener: handle missing in uniffiFree")
             }
         },
         uniffiClone: { (uniffiHandle: UInt64) -> UInt64 in
             do {
-                return try FfiConverterCallbackInterfaceSeparationProgressListener.handleMap.clone(handle: uniffiHandle)
+                return try FfiConverterCallbackInterfaceFfiSeparationListener.handleMap.clone(handle: uniffiHandle)
             } catch {
-                fatalError("Uniffi callback interface SeparationProgressListener: handle missing in uniffiClone")
+                fatalError("Uniffi callback interface FfiSeparationListener: handle missing in uniffiClone")
             }
         },
         onProgress: { (
@@ -1683,11 +1545,11 @@ fileprivate struct UniffiCallbackInterfaceSeparationProgressListener {
         ) in
             let makeCall = {
                 () throws -> Bool in
-                guard let uniffiObj = try? FfiConverterCallbackInterfaceSeparationProgressListener.handleMap.get(handle: uniffiHandle) else {
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceFfiSeparationListener.handleMap.get(handle: uniffiHandle) else {
                     throw UniffiInternalError.unexpectedStaleHandle
                 }
                 return uniffiObj.onProgress(
-                     progress: try FfiConverterTypeSeparationProgress_lift(progress)
+                     progress: try FfiConverterTypeFfiSeparationProgress_lift(progress)
                 )
             }
 
@@ -1702,23 +1564,23 @@ fileprivate struct UniffiCallbackInterfaceSeparationProgressListener {
     )]
 }
 
-private func uniffiCallbackInitSeparationProgressListener() {
-    uniffi_demucs_fn_init_callback_vtable_separationprogresslistener(UniffiCallbackInterfaceSeparationProgressListener.vtable)
+private func uniffiCallbackInitFfiSeparationListener() {
+    uniffi_demucs_ffi_fn_init_callback_vtable_ffiseparationlistener(UniffiCallbackInterfaceFfiSeparationListener.vtable)
 }
 
 // FfiConverter protocol for callback interfaces
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-fileprivate struct FfiConverterCallbackInterfaceSeparationProgressListener {
-    fileprivate static let handleMap = UniffiHandleMap<SeparationProgressListener>()
+fileprivate struct FfiConverterCallbackInterfaceFfiSeparationListener {
+    fileprivate static let handleMap = UniffiHandleMap<FfiSeparationListener>()
 }
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-extension FfiConverterCallbackInterfaceSeparationProgressListener : FfiConverter {
-    typealias SwiftType = SeparationProgressListener
+extension FfiConverterCallbackInterfaceFfiSeparationListener : FfiConverter {
+    typealias SwiftType = FfiSeparationListener
     typealias FfiType = UInt64
 
 #if swift(>=5.8)
@@ -1755,15 +1617,15 @@ extension FfiConverterCallbackInterfaceSeparationProgressListener : FfiConverter
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterCallbackInterfaceSeparationProgressListener_lift(_ handle: UInt64) throws -> SeparationProgressListener {
-    return try FfiConverterCallbackInterfaceSeparationProgressListener.lift(handle)
+public func FfiConverterCallbackInterfaceFfiSeparationListener_lift(_ handle: UInt64) throws -> FfiSeparationListener {
+    return try FfiConverterCallbackInterfaceFfiSeparationListener.lift(handle)
 }
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterCallbackInterfaceSeparationProgressListener_lower(_ v: SeparationProgressListener) -> UInt64 {
-    return FfiConverterCallbackInterfaceSeparationProgressListener.lower(v)
+public func FfiConverterCallbackInterfaceFfiSeparationListener_lower(_ v: FfiSeparationListener) -> UInt64 {
+    return FfiConverterCallbackInterfaceFfiSeparationListener.lower(v)
 }
 
 #if swift(>=5.8)
@@ -1793,8 +1655,8 @@ fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-fileprivate struct FfiConverterOptionTypeDemucsModel: FfiConverterRustBuffer {
-    typealias SwiftType = DemucsModel?
+fileprivate struct FfiConverterOptionTypeFfiDemucsModel: FfiConverterRustBuffer {
+    typealias SwiftType = FfiDemucsModel?
 
     public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
         guard let value = value else {
@@ -1802,13 +1664,13 @@ fileprivate struct FfiConverterOptionTypeDemucsModel: FfiConverterRustBuffer {
             return
         }
         writeInt(&buf, Int8(1))
-        FfiConverterTypeDemucsModel.write(value, into: &buf)
+        FfiConverterTypeFfiDemucsModel.write(value, into: &buf)
     }
 
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
-        case 1: return try FfiConverterTypeDemucsModel.read(from: &buf)
+        case 1: return try FfiConverterTypeFfiDemucsModel.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -1842,23 +1704,23 @@ fileprivate struct FfiConverterSequenceFloat: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-fileprivate struct FfiConverterSequenceTypeModelMetadata: FfiConverterRustBuffer {
-    typealias SwiftType = [ModelMetadata]
+fileprivate struct FfiConverterSequenceTypeFfiModelMetadata: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiModelMetadata]
 
-    public static func write(_ value: [ModelMetadata], into buf: inout [UInt8]) {
+    public static func write(_ value: [FfiModelMetadata], into buf: inout [UInt8]) {
         let len = Int32(value.count)
         writeInt(&buf, len)
         for item in value {
-            FfiConverterTypeModelMetadata.write(item, into: &buf)
+            FfiConverterTypeFfiModelMetadata.write(item, into: &buf)
         }
     }
 
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [ModelMetadata] {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiModelMetadata] {
         let len: Int32 = try readInt(&buf)
-        var seq = [ModelMetadata]()
+        var seq = [FfiModelMetadata]()
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
-            seq.append(try FfiConverterTypeModelMetadata.read(from: &buf))
+            seq.append(try FfiConverterTypeFfiModelMetadata.read(from: &buf))
         }
         return seq
     }
@@ -1867,23 +1729,23 @@ fileprivate struct FfiConverterSequenceTypeModelMetadata: FfiConverterRustBuffer
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-fileprivate struct FfiConverterSequenceTypeStemResult: FfiConverterRustBuffer {
-    typealias SwiftType = [StemResult]
+fileprivate struct FfiConverterSequenceTypeFfiStem: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiStem]
 
-    public static func write(_ value: [StemResult], into buf: inout [UInt8]) {
+    public static func write(_ value: [FfiStem], into buf: inout [UInt8]) {
         let len = Int32(value.count)
         writeInt(&buf, len)
         for item in value {
-            FfiConverterTypeStemResult.write(item, into: &buf)
+            FfiConverterTypeFfiStem.write(item, into: &buf)
         }
     }
 
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [StemResult] {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiStem] {
         let len: Int32 = try readInt(&buf)
-        var seq = [StemResult]()
+        var seq = [FfiStem]()
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
-            seq.append(try FfiConverterTypeStemResult.read(from: &buf))
+            seq.append(try FfiConverterTypeFfiStem.read(from: &buf))
         }
         return seq
     }
@@ -1892,23 +1754,23 @@ fileprivate struct FfiConverterSequenceTypeStemResult: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-fileprivate struct FfiConverterSequenceTypeStemKind: FfiConverterRustBuffer {
-    typealias SwiftType = [StemKind]
+fileprivate struct FfiConverterSequenceTypeFfiStemKind: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiStemKind]
 
-    public static func write(_ value: [StemKind], into buf: inout [UInt8]) {
+    public static func write(_ value: [FfiStemKind], into buf: inout [UInt8]) {
         let len = Int32(value.count)
         writeInt(&buf, len)
         for item in value {
-            FfiConverterTypeStemKind.write(item, into: &buf)
+            FfiConverterTypeFfiStemKind.write(item, into: &buf)
         }
     }
 
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [StemKind] {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiStemKind] {
         let len: Int32 = try readInt(&buf)
-        var seq = [StemKind]()
+        var seq = [FfiStemKind]()
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
-            seq.append(try FfiConverterTypeStemKind.read(from: &buf))
+            seq.append(try FfiConverterTypeFfiStemKind.read(from: &buf))
         }
         return seq
     }
@@ -1928,7 +1790,7 @@ fileprivate func uniffiRustCallAsync<F, T>(
 ) async throws -> T {
     // Make sure to call the ensure init function since future creation doesn't have a
     // RustCallStatus param, so doesn't use makeRustCall()
-    uniffiEnsureDemucsInitialized()
+    uniffiEnsureDemucsFfiInitialized()
     let rustFuture = rustFutureFunc()
     defer {
         freeFunc(rustFuture)
@@ -1961,121 +1823,97 @@ fileprivate func uniffiFutureContinuationCallback(handle: UInt64, pollResult: In
         print("uniffiFutureContinuationCallback invalid handle")
     }
 }
-/**
- * Metadata for every supported model variant.
- */
-public func allModels() -> [ModelMetadata]  {
-    return try!  FfiConverterSequenceTypeModelMetadata.lift(try! rustCall() {
-    uniffi_demucs_fn_func_all_models($0
+public func allModels() -> [FfiModelMetadata]  {
+    return try!  FfiConverterSequenceTypeFfiModelMetadata.lift(try! rustCall() {
+    uniffi_demucs_ffi_fn_func_all_models($0
     )
 })
 }
-/**
- * Filesystem path the model's weights live at once downloaded, or None if
- * not cached yet.
- */
-public func cachedModelPath(model: DemucsModel) -> String?  {
+public func cachedModelPath(model: FfiDemucsModel) -> String?  {
     return try!  FfiConverterOptionString.lift(try! rustCall() {
-    uniffi_demucs_fn_func_cached_model_path(
-        FfiConverterTypeDemucsModel_lower(model),$0
+    uniffi_demucs_ffi_fn_func_cached_model_path(
+        FfiConverterTypeFfiDemucsModel_lower(model),$0
     )
 })
 }
 /**
- * Override the model cache directory.
- *
- * On iOS/tvOS/visionOS call this once at app launch — before
- * `downloadModel` or `DemucsEngine.loadModel` — with a directory inside the
- * app sandbox, e.g. the app's Application Support or Caches directory.
- * The directory is created if missing.
+ * Samples per chunk at 44.1 kHz.
+ */
+public func chunkLength() -> UInt64  {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_demucs_ffi_fn_func_chunk_length($0
+    )
+})
+}
+/**
+ * Sets where model weights are stored. Sandboxed apps should call this once
+ * at launch with a directory inside their container. Without it, weights go
+ * to the platform cache directory under `demucs-rs/`.
  */
 public func configureCacheDir(path: String)  {try! rustCall() {
-    uniffi_demucs_fn_func_configure_cache_dir(
+    uniffi_demucs_ffi_fn_func_configure_cache_dir(
         FfiConverterString.lower(path),$0
     )
 }
 }
 /**
- * Delete a model's weights from the local cache. Returns true if a file was
- * removed.
+ * Returns `true` if a file was removed.
  */
-public func deleteCachedModel(model: DemucsModel) -> Bool  {
+public func deleteCachedModel(model: FfiDemucsModel) -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
-    uniffi_demucs_fn_func_delete_cached_model(
-        FfiConverterTypeDemucsModel_lower(model),$0
+    uniffi_demucs_ffi_fn_func_delete_cached_model(
+        FfiConverterTypeFfiDemucsModel_lower(model),$0
     )
 })
 }
 /**
- * Whether the model's weights are already in the local cache.
+ * Downloads the model's weights from HuggingFace into the cache directory.
+ * Returns immediately if they are already there.
  */
-public func isModelCached(model: DemucsModel) -> Bool  {
-    return try!  FfiConverterBool.lift(try! rustCall() {
-    uniffi_demucs_fn_func_is_model_cached(
-        FfiConverterTypeDemucsModel_lower(model),$0
-    )
-})
-}
-/**
- * Metadata (name, size, stems, download URL) for a model variant.
- */
-public func modelMetadata(model: DemucsModel) -> ModelMetadata  {
-    return try!  FfiConverterTypeModelMetadata_lift(try! rustCall() {
-    uniffi_demucs_fn_func_model_metadata(
-        FfiConverterTypeDemucsModel_lower(model),$0
-    )
-})
-}
-/**
- * Number of inference chunks a track of `n_samples` (per channel, at
- * 44100 Hz) is split into. Useful for sizing progress UIs.
- */
-public func numChunks(nSamples: UInt64) -> UInt64  {
-    return try!  FfiConverterUInt64.lift(try! rustCall() {
-    uniffi_demucs_fn_func_num_chunks(
-        FfiConverterUInt64.lower(nSamples),$0
-    )
-})
-}
-/**
- * Download a model's weights into the local cache.
- *
- * No-op (immediately reports `done`) if the model is already cached. Call
- * `configureCacheDir` first on sandboxed platforms.
- */
-public func downloadModel(model: DemucsModel, listener: DownloadProgressListener)async throws   {
+public func downloadModel(model: FfiDemucsModel, listener: FfiDownloadListener)async throws   {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_demucs_fn_func_download_model(FfiConverterTypeDemucsModel_lower(model),FfiConverterCallbackInterfaceDownloadProgressListener_lower(listener)
+                uniffi_demucs_ffi_fn_func_download_model(FfiConverterTypeFfiDemucsModel_lower(model),FfiConverterCallbackInterfaceFfiDownloadListener_lower(listener)
                 )
             },
-            pollFunc: ffi_demucs_rust_future_poll_void,
-            completeFunc: ffi_demucs_rust_future_complete_void,
-            freeFunc: ffi_demucs_rust_future_free_void,
+            pollFunc: ffi_demucs_ffi_rust_future_poll_void,
+            completeFunc: ffi_demucs_ffi_rust_future_complete_void,
+            freeFunc: ffi_demucs_ffi_rust_future_free_void,
             liftFunc: { $0 },
-            errorHandler: FfiConverterTypeDemucsFfiError_lift
+            errorHandler: FfiConverterTypeFfiDemucsError_lift
         )
 }
 /**
- * `DemucsEngine.separate` with progress reporting and cancellation.
- *
- * A free function because UniFFI 0.31 only supports callback interfaces as
- * free-function parameters.
+ * All fine-tuned stem selections share one weights file, so this answers the
+ * same for every `FineTuned` value.
  */
-public func separateWithProgress(engine: DemucsEngine, left: [Float], right: [Float], sampleRate: UInt32, listener: SeparationProgressListener)async throws  -> [StemResult]  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_demucs_fn_func_separate_with_progress(FfiConverterTypeDemucsEngine_lower(engine),FfiConverterSequenceFloat.lower(left),FfiConverterSequenceFloat.lower(right),FfiConverterUInt32.lower(sampleRate),FfiConverterCallbackInterfaceSeparationProgressListener_lower(listener)
-                )
-            },
-            pollFunc: ffi_demucs_rust_future_poll_rust_buffer,
-            completeFunc: ffi_demucs_rust_future_complete_rust_buffer,
-            freeFunc: ffi_demucs_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterSequenceTypeStemResult.lift,
-            errorHandler: FfiConverterTypeDemucsFfiError_lift
-        )
+public func isModelCached(model: FfiDemucsModel) -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_demucs_ffi_fn_func_is_model_cached(
+        FfiConverterTypeFfiDemucsModel_lower(model),$0
+    )
+})
+}
+public func modelMetadata(model: FfiDemucsModel) -> FfiModelMetadata  {
+    return try!  FfiConverterTypeFfiModelMetadata_lift(try! rustCall() {
+    uniffi_demucs_ffi_fn_func_model_metadata(
+        FfiConverterTypeFfiDemucsModel_lower(model),$0
+    )
+})
+}
+/**
+ * How many chunks `separate` will split this many input samples into, for
+ * sizing progress UI up front. `sample_rate` is the input rate; audio is
+ * chunked after resampling to 44.1 kHz.
+ */
+public func numChunks(nSamples: UInt64, sampleRate: UInt32) -> UInt64  {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_demucs_ffi_fn_func_num_chunks(
+        FfiConverterUInt64.lower(nSamples),
+        FfiConverterUInt32.lower(sampleRate),$0
+    )
+})
 }
 
 private enum InitializationResult {
@@ -2089,73 +1927,73 @@ private let initializationResult: InitializationResult = {
     // Get the bindings contract version from our ComponentInterface
     let bindings_contract_version = 30
     // Get the scaffolding contract version by calling the into the dylib
-    let scaffolding_contract_version = ffi_demucs_uniffi_contract_version()
+    let scaffolding_contract_version = ffi_demucs_ffi_uniffi_contract_version()
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
-    if (uniffi_demucs_checksum_func_all_models() != 40632) {
+    if (uniffi_demucs_ffi_checksum_func_all_models() != 35841) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_demucs_checksum_func_cached_model_path() != 59385) {
+    if (uniffi_demucs_ffi_checksum_func_cached_model_path() != 60660) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_demucs_checksum_func_configure_cache_dir() != 33315) {
+    if (uniffi_demucs_ffi_checksum_func_chunk_length() != 30511) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_demucs_checksum_func_delete_cached_model() != 23501) {
+    if (uniffi_demucs_ffi_checksum_func_configure_cache_dir() != 17121) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_demucs_checksum_func_is_model_cached() != 9391) {
+    if (uniffi_demucs_ffi_checksum_func_delete_cached_model() != 32733) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_demucs_checksum_func_model_metadata() != 64919) {
+    if (uniffi_demucs_ffi_checksum_func_download_model() != 18057) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_demucs_checksum_func_num_chunks() != 27500) {
+    if (uniffi_demucs_ffi_checksum_func_is_model_cached() != 62970) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_demucs_checksum_func_download_model() != 37675) {
+    if (uniffi_demucs_ffi_checksum_func_model_metadata() != 60733) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_demucs_checksum_func_separate_with_progress() != 6510) {
+    if (uniffi_demucs_ffi_checksum_func_num_chunks() != 4306) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_demucs_checksum_method_demucsengine_is_loaded() != 28086) {
+    if (uniffi_demucs_ffi_checksum_method_ffidemucsengine_is_loaded() != 13782) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_demucs_checksum_method_demucsengine_load_model() != 54613) {
+    if (uniffi_demucs_ffi_checksum_method_ffidemucsengine_load_model() != 18700) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_demucs_checksum_method_demucsengine_loaded_model() != 45821) {
+    if (uniffi_demucs_ffi_checksum_method_ffidemucsengine_loaded_model() != 27072) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_demucs_checksum_method_demucsengine_separate() != 52086) {
+    if (uniffi_demucs_ffi_checksum_method_ffidemucsengine_separate() != 27889) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_demucs_checksum_method_demucsengine_unload_model() != 24792) {
+    if (uniffi_demucs_ffi_checksum_method_ffidemucsengine_unload_model() != 21923) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_demucs_checksum_method_demucsengine_warmup() != 20811) {
+    if (uniffi_demucs_ffi_checksum_method_ffidemucsengine_warmup() != 4128) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_demucs_checksum_constructor_demucsengine_new() != 51674) {
+    if (uniffi_demucs_ffi_checksum_constructor_ffidemucsengine_new() != 48414) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_demucs_checksum_method_downloadprogresslistener_on_progress() != 44819) {
+    if (uniffi_demucs_ffi_checksum_method_ffidownloadlistener_on_progress() != 42698) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_demucs_checksum_method_separationprogresslistener_on_progress() != 56005) {
+    if (uniffi_demucs_ffi_checksum_method_ffiseparationlistener_on_progress() != 32252) {
         return InitializationResult.apiChecksumMismatch
     }
 
-    uniffiCallbackInitDownloadProgressListener()
-    uniffiCallbackInitSeparationProgressListener()
+    uniffiCallbackInitFfiDownloadListener()
+    uniffiCallbackInitFfiSeparationListener()
     return InitializationResult.ok
 }()
 
 // Make the ensure init function public so that other modules which have external type references to
 // our types can call it.
-public func uniffiEnsureDemucsInitialized() {
+public func uniffiEnsureDemucsFfiInitialized() {
     switch initializationResult {
     case .ok:
         break

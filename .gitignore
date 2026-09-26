@@ -1,2 +1,8 @@
 .DS_Store
 .build/
+.local/
+build/
+DerivedData/
+DemucsFramework.xcframework/
+Examples/DemucsExample/*.xcodeproj/
+*.xcresult
