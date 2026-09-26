@@ -25,6 +25,9 @@ final class SeparationViewModel: ObservableObject {
 
     private let engine = DemucsEngine()
     private var task: Task<Void, Never>?
+    /// Bumped on every new run so a cancelled run that unwinds late can't
+    /// overwrite the state of the run that replaced it.
+    private var generation = 0
 
     var isBusy: Bool {
         switch phase {
@@ -36,7 +39,9 @@ final class SeparationViewModel: ObservableObject {
     func separate(fileAt url: URL) {
         task?.cancel()
         stems = []
-        task = Task { await run(url: url) }
+        generation += 1
+        let current = generation
+        task = Task { await run(url: url, generation: current) }
     }
 
     func cancel() {
@@ -54,7 +59,7 @@ final class SeparationViewModel: ObservableObject {
         }
     }
 
-    private func run(url: URL) async {
+    private func run(url: URL, generation current: Int) async {
         do {
             let model = model
             if !DemucsEngine.isDownloaded(model) {
@@ -81,18 +86,22 @@ final class SeparationViewModel: ObservableObject {
             let outputDirectory = FileManager.default.temporaryDirectory
                 .appendingPathComponent(url.deletingPathExtension().lastPathComponent, isDirectory: true)
             try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
+            guard current == generation else { return }
             stems = try separated.map { stem in
                 let file = outputDirectory.appendingPathComponent("\(stem.kind.rawValue).wav")
                 try AudioFile.write(stem, sampleRate: audio.sampleRate, to: file)
                 return StemFile(kind: stem.kind, url: file)
             }
+            guard current == generation else { return }
             phase = .done
-        } catch DemucsError.cancelled {
-            phase = .idle
-        } catch is CancellationError {
-            phase = .idle
         } catch {
-            phase = .failed(error.localizedDescription)
+            guard current == generation else { return }
+            switch error {
+            case DemucsError.cancelled, is CancellationError:
+                phase = .idle
+            default:
+                phase = .failed(error.localizedDescription)
+            }
         }
     }
 }
@@ -110,8 +119,9 @@ enum AudioFile {
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
 
-        let file = try AVAudioFile(forReading: url)
-        let format = file.processingFormat // Float32, deinterleaved
+        // Force Float32 so 16/24-bit PCM files decode into floatChannelData.
+        let file = try AVAudioFile(forReading: url, commonFormat: .pcmFormatFloat32, interleaved: false)
+        let format = file.processingFormat
         guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(file.length)) else {
             throw DemucsError.invalidInput("Could not allocate an audio buffer.")
         }
@@ -141,8 +151,12 @@ enum AudioFile {
             throw DemucsError.io("Could not allocate an audio buffer.")
         }
         buffer.frameLength = AVAudioFrameCount(stem.left.count)
-        stem.left.withUnsafeBufferPointer { channels[0].update(from: $0.baseAddress!, count: $0.count) }
-        stem.right.withUnsafeBufferPointer { channels[1].update(from: $0.baseAddress!, count: $0.count) }
+        for (index, samples) in [stem.left, stem.right].enumerated() {
+            samples.withUnsafeBufferPointer { source in
+                guard let base = source.baseAddress else { return }
+                channels[index].update(from: base, count: source.count)
+            }
+        }
 
         try? FileManager.default.removeItem(at: url)
         let file = try AVAudioFile(forWriting: url, settings: format.settings)
