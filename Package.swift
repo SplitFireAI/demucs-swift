@@ -58,6 +58,11 @@ let package = Package(
                 .linkedFramework("Security"),
             ]
         ),
+        .testTarget(
+            name: "DemucsTests",
+            dependencies: ["Demucs"],
+            path: "Tests/DemucsTests"
+        ),
     ],
     // UniFFI 0.31's generated bindings predate Swift 6's region isolation
     // checks. The hand-written Demucs API is concurrency-safe; the generated
